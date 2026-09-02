@@ -77,13 +77,26 @@ def build_hogql(amount: int, unit: str, cur_ts: str, cur_uuid: str, limit: int) 
     ts = cur_ts.replace("'", "''")
     uid = cur_uuid.replace("'", "''")
     columns = ",\n       ".join(_SELECT_COLUMNS)
+    # Keyset predicate. On the first pull the cursor is the epoch sentinel with an
+    # empty uuid; comparing the UUID-typed `uuid` column against '' is a type error
+    # in HogQL/ClickHouse (HTTP 400), so fall back to a timestamp-only bound then.
+    # `uuid` is cast to string for a well-defined tie-break comparison, and the
+    # timestamp sentinel is parsed with toDateTime64 to accept the millisecond form.
+    lo = f"toDateTime64('{ts}', 3)"
+    if uid:
+        keyset = (
+            f"  AND ((timestamp > {lo}) "
+            f"OR (timestamp = {lo} AND toString(uuid) > '{uid}'))\n"
+        )
+    else:
+        keyset = f"  AND timestamp > {lo}\n"
     return (
         f"SELECT {columns}\n"
         "FROM events\n"
         "WHERE event = '$ai_generation'\n"
         f"  AND timestamp >= now() - INTERVAL {int(amount)} {unit}\n"
-        f"  AND ((timestamp > '{ts}') OR (timestamp = '{ts}' AND uuid > '{uid}'))\n"
-        "ORDER BY timestamp ASC, uuid ASC\n"
+        f"{keyset}"
+        "ORDER BY timestamp ASC, toString(uuid) ASC\n"
         f"LIMIT {int(limit)}"
     )
 
@@ -112,7 +125,13 @@ def _http_query(url, headers, body, timeout=120):  # pragma: no cover - needs ne
     import requests
 
     resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
-    resp.raise_for_status()
+    if resp.status_code >= 400:
+        # Surface PostHog's error body — it names the offending query/field,
+        # which a bare raise_for_status() throws away.
+        detail = resp.text[:1000]
+        raise requests.exceptions.HTTPError(
+            f"{resp.status_code} from PostHog query API: {detail}", response=resp
+        )
     return resp.json()
 
 

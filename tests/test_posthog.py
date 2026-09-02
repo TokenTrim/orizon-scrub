@@ -63,11 +63,20 @@ def test_build_hogql_has_keyset_and_window():
     sql = build_hogql(30, "DAY", "2026-08-01 00:00:00.000", "abc", 5000)
     assert "INTERVAL 30 DAY" in sql
     assert "event = '$ai_generation'" in sql
-    assert "timestamp > '2026-08-01 00:00:00.000'" in sql
-    assert "uuid > 'abc'" in sql
-    assert "ORDER BY timestamp ASC, uuid ASC" in sql
+    assert "toDateTime64('2026-08-01 00:00:00.000', 3)" in sql
+    assert "toString(uuid) > 'abc'" in sql
+    assert "ORDER BY timestamp ASC, toString(uuid) ASC" in sql
     assert "LIMIT 5000" in sql
     assert "OFFSET" not in sql  # OFFSET paging is rejected by PostHog for personal keys
+
+
+def test_build_hogql_first_pull_has_no_uuid_string_compare():
+    # Epoch sentinel with an empty uuid: comparing the UUID column to '' is a
+    # HogQL type error (HTTP 400), so the first pull must be timestamp-only.
+    sql = build_hogql(30, "DAY", "1970-01-01 00:00:00.000", "", 5000)
+    assert "uuid > ''" not in sql
+    assert "toString(uuid) > ''" not in sql
+    assert "timestamp > toDateTime64('1970-01-01 00:00:00.000', 3)" in sql
 
 
 # -- cursor round-trip ------------------------------------------------------
@@ -108,7 +117,7 @@ def test_fetch_rows_resumes_from_start_cursor():
     )
     assert rows == [] and final is None  # no rows -> no cursor advance
     assert "2026-08-15 09:00:00.000" in fake.hogql(0)
-    assert "uuid > 'prev'" in fake.hogql(0)
+    assert "toString(uuid) > 'prev'" in fake.hogql(0)
 
 
 # -- stitching + conversion -------------------------------------------------
