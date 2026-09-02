@@ -7,21 +7,42 @@ except the model download (Hugging Face, first run) and your own PostHog queries
 
 ## Install
 
+Clone and run with [`uv`](https://docs.astral.sh/uv/) — it resolves every
+dependency (including the model package `opf` and Torch) into an isolated env on
+first run:
+
 ```bash
-uv run orizon-scrub ...          # from a checkout (recommended)
-# or: pip install 'git+https://github.com/openai/privacy-filter.git' && pip install -e .
+git clone https://github.com/Lyadalachanchu/orizon-scrub.git
+cd orizon-scrub
+uv run orizon-scrub            # launches the wizard; first run installs deps
 ```
 
-The Privacy Filter model (~2.8 GB) downloads to `~/.opf/` on first scrub.
+Or install into your own environment with `pip install -e .`. The Privacy Filter
+model (~2.8 GB) downloads to `~/.opf/` on the first scrub.
 
-## Run
+## Quickstart — interactive wizard
 
-Run it with no arguments for an interactive wizard (pick a source, answer a few
-prompts, go) — or use flags directly:
+Run with **no arguments** and it walks you through everything:
+
+```text
+$ orizon-scrub
+orizon-scrub — interactive setup (Ctrl-C to cancel)
+
+Where are the traces?
+  1) Local JSONL file
+  2) PostHog (pull traces)
+Choose [1]: 1
+Path to JSONL file: traces.jsonl
+Output file [traces.scrubbed.jsonl]:
+Device (auto/cpu/cuda) [auto]:
+```
+
+Choose PostHog instead and it prompts for the host, project id, personal API key
+(entered hidden), and time window — no environment variables to set up by hand.
+
+## Scripting — flags
 
 ```bash
-orizon-scrub                                  # interactive wizard
-
 # A) scrub a local JSONL file (one conversation per line, OpenAI chat format)
 orizon-scrub traces.jsonl                     # -> traces.scrubbed.jsonl
 
