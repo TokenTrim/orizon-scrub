@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orizon-scrub"
+version = "0.1.0"
+description = "Strip PII from AI agent traces locally using OpenAI's Privacy Filter model."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+dependencies = [
+    # Official openai/privacy-filter package (pure torch + tiktoken; no transformers
+    # needed). Pinned to an exact SHA because it is pre-release (v0.1.0).
+    "opf @ git+https://github.com/openai/privacy-filter.git@f7f00ca7fb869683eb732c010299d901457f19c3",
+    "requests>=2.28",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+orizon-scrub = "orizon_scrub.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["orizon_scrub*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
