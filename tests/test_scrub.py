@@ -295,6 +295,19 @@ def test_card_formats_map_to_same_token():
     assert tokens == ["[ACCOUNT_1]"] * 3  # one card in three formats -> one token
 
 
+def test_wizard_local_file(monkeypatch, tmp_path):
+    import orizon_scrub.__main__ as m
+
+    monkeypatch.setattr(m, "PrivacyFilterDetector", lambda *a, **k: StubDetector())
+    out = tmp_path / "wiz.jsonl"
+    answers = iter(["1", str(FIXTURE), str(out), "cpu"])  # local; path; output; device
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    rc = m.main(["--wizard"])
+    assert rc == 0
+    assert out.exists()
+    assert len([x for x in out.read_text().splitlines() if x.strip()]) == 3
+
+
 def _opf_ready():
     try:
         import opf  # noqa: F401

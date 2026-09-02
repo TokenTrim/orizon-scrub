@@ -16,7 +16,12 @@ The Privacy Filter model (~2.8 GB) downloads to `~/.opf/` on first scrub.
 
 ## Run
 
+Run it with no arguments for an interactive wizard (pick a source, answer a few
+prompts, go) — or use flags directly:
+
 ```bash
+orizon-scrub                                  # interactive wizard
+
 # A) scrub a local JSONL file (one conversation per line, OpenAI chat format)
 orizon-scrub traces.jsonl                     # -> traces.scrubbed.jsonl
 

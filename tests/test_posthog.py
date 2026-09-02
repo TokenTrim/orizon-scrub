@@ -298,6 +298,24 @@ def test_main_rolls_back_partial_append_on_failure(monkeypatch, tmp_path):
     assert json.loads(cursor.read_text()) == {"ts": "t1", "uuid": "a"}  # cursor not advanced
 
 
+def test_wizard_posthog(monkeypatch, tmp_path):
+    import orizon_scrub.__main__ as m
+
+    monkeypatch.setattr(m, "PrivacyFilterDetector", _Blind)
+    recs = [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "hi"}]})]
+    monkeypatch.setattr(m.posthog, "pull", lambda *a, **k: (recs, ("ts", "u")))
+    monkeypatch.setattr(m, "_prompt_secret", lambda label: "phx_secret")
+    out = tmp_path / "w.jsonl"
+    cur = tmp_path / "c.json"
+    # choice=PostHog, host, project id, window, output, device
+    answers = iter(["2", "https://us.posthog.com", "999", "30d", str(out), "cpu"])
+    monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
+    rc = m.main(["--wizard", "--cursor-file", str(cur)])
+    assert rc == 0
+    assert out.exists()
+    assert json.loads(out.read_text().splitlines()[0])["trace_id"] == "t1"
+
+
 def test_main_empty_pull_does_not_overwrite_existing_output(monkeypatch, tmp_path):
     import orizon_scrub.__main__ as m
 

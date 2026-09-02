@@ -38,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--project-id", default=os.environ.get("POSTHOG_PROJECT_ID"), help="PostHog project id (env: POSTHOG_PROJECT_ID).")
     p.add_argument("--device", choices=("cpu", "cuda"), default=None, help="Inference device (default: auto-detect).")
     p.add_argument("--cursor-file", default=".orizon-scrub-cursor.json", help="PostHog resume cursor file (default: .orizon-scrub-cursor.json).")
+    p.add_argument("--wizard", action="store_true", help="Interactive setup (also launched when run with no arguments in a terminal).")
     return p
 
 
@@ -104,8 +105,79 @@ def _source(args):
     return read_jsonl(args.input), default_output_path(args.input), (lambda: None), False
 
 
+def _prompt(label, default=None, required=False, validate=None):
+    suffix = f" [{default}]" if default else ""
+    while True:
+        raw = input(f"{label}{suffix}: ").strip()
+        if not raw and default is not None:
+            raw = default
+        if not raw:
+            if required:
+                print("  (required)")
+                continue
+            return ""
+        if validate and not validate(raw):
+            print("  (not found / invalid, try again)")
+            continue
+        return raw
+
+
+def _prompt_secret(label):
+    import getpass
+
+    while True:
+        val = getpass.getpass(f"{label}: ").strip()
+        if val:
+            return val
+        print("  (required)")
+
+
+def _prompt_choice(label, options):
+    print(label)
+    for i, opt in enumerate(options, 1):
+        print(f"  {i}) {opt}")
+    while True:
+        raw = input("Choose [1]: ").strip() or "1"
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return int(raw)
+        print("  (enter a number)")
+
+
+def _model_cached() -> bool:
+    path = os.environ.get("OPF_CHECKPOINT") or os.path.expanduser("~/.opf/privacy_filter")
+    return os.path.isdir(path)
+
+
+def run_wizard(args):
+    """Fill ``args`` interactively. Returns the same namespace, ready for the pipeline."""
+    print("orizon-scrub — interactive setup (Ctrl-C to cancel)\n")
+    if _prompt_choice("Where are the traces?", ["Local JSONL file", "PostHog (pull traces)"]) == 1:
+        args.posthog = False
+        args.input = _prompt("Path to JSONL file", required=True, validate=os.path.exists)
+        args.output = args.output or _prompt("Output file", default=default_output_path(args.input))
+    else:
+        args.posthog = True
+        args.host = _prompt("PostHog host", default=args.host or "https://us.posthog.com")
+        args.project_id = _prompt("PostHog project id", default=args.project_id, required=True)
+        args.api_key = args.api_key or _prompt_secret("PostHog personal API key (phx_..., query:read scope)")
+        args.window = _prompt("Time window (e.g. 30d, 12h, 4w)", default=args.window or "30d")
+        args.output = args.output or _prompt("Output file", default="traces.scrubbed.jsonl")
+    dev = _prompt("Device (auto/cpu/cuda)", default=args.device or "auto")
+    args.device = None if dev == "auto" else dev
+    if not _model_cached():
+        print("\nNote: the first scrub downloads the ~2.8GB Privacy Filter model to ~/.opf/.")
+    print()
+    return args
+
+
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.wizard or (not args.input and not args.posthog and sys.stdin.isatty()):
+        try:
+            args = run_wizard(args)
+        except (KeyboardInterrupt, EOFError):
+            print("\nCancelled.", file=sys.stderr)
+            return 130
     records, default_out, commit, append = _source(args)
     out_path = args.output or default_out
 
