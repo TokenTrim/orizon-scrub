@@ -26,7 +26,10 @@ from orizon_scrub.scrub import (
     regex_pii_spans,
 )
 
+import gen_pii  # sibling module in tests/ (pytest puts this dir on sys.path)
+
 FIXTURE = Path(__file__).parent / "fixtures" / "sample.jsonl"
+PII_SAMPLE = Path(__file__).parent / "fixtures" / "pii_sample.jsonl"
 
 # Ordered (category, pattern) list mimicking openai/privacy-filter's v2 taxonomy.
 _STUB_PATTERNS = [
@@ -312,6 +315,45 @@ def test_load_custom_patterns(tmp_path):
     bad.write_text(json.dumps([{"pattern": "x"}]))  # missing category
     with pytest.raises(ValueError):
         load_custom_patterns(str(bad))
+
+
+def test_gen_pii_produces_wellformed_pii_conversations():
+    convs = gen_pii.generate(20, seed=42)
+    assert len(convs) == 20
+    for c in convs:
+        assert c["messages"] and c["messages"][0]["role"] == "system"
+        assert all("role" in m and "content" in m for m in c["messages"])
+    # Across the corpus the leak-relevant PII is present (not every scenario has all).
+    corpus = "\n".join(json.dumps(c) for c in convs)
+    assert find_leaks(corpus), "corpus should contain leak-detectable PII"
+    kinds = {k for k, _ in find_leaks(corpus)}
+    assert {"email", "card"} <= kinds
+    # Every generated card is Luhn-valid, so the leak net treats it as a real card.
+    for _ in range(50):
+        card = gen_pii.make_card().replace(" ", "")
+        assert gen_pii.luhn_ok(card)
+
+
+def test_pii_sample_fixture_matches_generator():
+    # The committed fixture must equal generate(30, 42) so it never drifts silently.
+    expected = [json.dumps(c, sort_keys=True) for c in gen_pii.generate(30, seed=42)]
+    actual = [json.dumps(json.loads(x), sort_keys=True)
+              for x in PII_SAMPLE.read_text().splitlines() if x.strip()]
+    assert actual == expected
+
+
+def test_generated_pii_sample_scrubs_leak_free():
+    # Scrub the high-PII sample with the deterministic regex layer (no model) and
+    # confirm the fail-closed net finds no residual email, card, or secret, and
+    # that message structure is preserved.
+    scrubber = Scrubber(_RegexDetector())
+    convs = [json.loads(x) for x in PII_SAMPLE.read_text().splitlines() if x.strip()]
+    assert convs, "sample fixture is empty"
+    for original in convs:
+        out = scrubber.scrub_conversation(original, Counter())
+        assert find_leaks(json.dumps(out, ensure_ascii=False)) == []
+        assert len(out["messages"]) == len(original["messages"])
+        assert [m["role"] for m in out["messages"]] == [m["role"] for m in original["messages"]]
 
 
 def test_real_card_next_to_punctuation_still_caught():
