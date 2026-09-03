@@ -1,0 +1,5 @@
+[
+  { "category": "employee_id", "pattern": "\\bEMP-\\d{6}\\b" },
+  { "category": "internal_ticket", "pattern": "\\b(?:JIRA|TICKET)-\\d+\\b", "ignore_case": true },
+  { "category": "account_number", "pattern": "\\bACME-ACCT-[0-9A-Z]{10}\\b" }
+]

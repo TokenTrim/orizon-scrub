@@ -255,7 +255,8 @@ class _Blind:
         return text, []
 
 
-def _run_posthog_main(monkeypatch, tmp_path, recs, final_cursor, out_name="out.jsonl"):
+def _run_posthog_main(monkeypatch, tmp_path, recs, final_cursor, out_name="out.jsonl",
+                      extra_args=()):
     import orizon_scrub.__main__ as m
 
     monkeypatch.setattr(m, "PrivacyFilterDetector", _Blind)
@@ -265,8 +266,34 @@ def _run_posthog_main(monkeypatch, tmp_path, recs, final_cursor, out_name="out.j
     rc = m.main([
         "--posthog", "--host", "https://us.posthog.com", "--api-key", "phx_k",
         "--project-id", "1", "--cursor-file", str(cursor), "-o", str(out),
+        *extra_args,
     ])
     return rc, cursor, out
+
+
+def test_main_writes_report(monkeypatch, tmp_path):
+    report = tmp_path / "report.json"
+    recs = [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "hi"}]})]
+    rc, _, _ = _run_posthog_main(
+        monkeypatch, tmp_path, recs, ("2026-09-01T00:00:00Z", "a"),
+        extra_args=["--report", str(report), "--mode", "redact"],
+    )
+    assert rc == 0
+    data = json.loads(report.read_text())
+    assert data["tool"] == "orizon-scrub"
+    assert data["mode"] == "redact"
+    assert data["conversations_processed"] == 1
+    assert data["spans_redacted_total"] == 0  # blind detector, no spans
+    assert "spans_by_category" in data and "generated_at" in data
+
+
+def test_main_bad_patterns_file_errors(monkeypatch, tmp_path):
+    recs = [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "hi"}]})]
+    with pytest.raises(SystemExit):
+        _run_posthog_main(
+            monkeypatch, tmp_path, recs, ("2026-09-01T00:00:00Z", "a"),
+            extra_args=["--patterns", str(tmp_path / "does-not-exist.json")],
+        )
 
 
 def test_main_commits_cursor_only_after_success(monkeypatch, tmp_path):
@@ -364,8 +391,8 @@ def test_wizard_posthog(monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_prompt_secret", lambda label: "phx_secret")
     out = tmp_path / "w.jsonl"
     cur = tmp_path / "c.json"
-    # choice=PostHog, host, project id, window, output, device
-    answers = iter(["2", "https://us.posthog.com", "999", "30d", str(out), "cpu"])
+    # choice=PostHog, host, project id, window, output, device, mode, patterns(skip)
+    answers = iter(["2", "https://us.posthog.com", "999", "30d", str(out), "cpu", "1", ""])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     rc = m.main(["--wizard", "--cursor-file", str(cur)])
     assert rc == 0

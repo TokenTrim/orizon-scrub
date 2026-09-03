@@ -16,10 +16,12 @@ from pathlib import Path
 import pytest
 
 from orizon_scrub.scrub import (
+    CustomPattern,
     PrivacyFilterDetector,
     Scrubber,
     Span,
     find_leaks,
+    load_custom_patterns,
     merge_spans,
     regex_pii_spans,
 )
@@ -251,6 +253,67 @@ def test_digit_run_inside_identifier_is_not_a_card():
     assert find_leaks(payload) == []
 
 
+class _RegexDetector:
+    """Detector whose spans come purely from the regex layer (incl. extra patterns)."""
+
+    def __init__(self, extra=()):
+        self.extra = extra
+
+    def detect(self, text):
+        return text, regex_pii_spans(text, self.extra)
+
+
+def test_redact_mode_is_unlinkable():
+    # Redact mode collapses every value of a category to one unnumbered token, so
+    # two distinct people are indistinguishable and linkage is removed.
+    scrubber = Scrubber(StubDetector(), mode="redact")
+    conv = {"messages": [{"role": "user", "content": "Sarah Johnson met Michael Chen"}]}
+    out = json.dumps(scrubber.scrub_conversation(conv, Counter()), ensure_ascii=False)
+    assert "Sarah Johnson" not in out and "Michael Chen" not in out
+    assert out.count("[PERSON]") == 2  # both, same token
+    assert "[PERSON_1]" not in out and "[PERSON_2]" not in out
+
+
+def test_invalid_mode_rejected():
+    with pytest.raises(ValueError):
+        Scrubber(StubDetector(), mode="anonymize")
+
+
+def test_custom_patterns_detected_scrubbed_and_leak_checked():
+    cp = [CustomPattern("employee_id", re.compile(r"EMP-\d{4}"))]
+    text = "ticket from EMP-1234 and EMP-1234 again"
+    # Detected as a span with the custom category...
+    cats = {s.category for s in regex_pii_spans(text, cp)}
+    assert "employee_id" in cats
+    # ...caught by the leak check...
+    assert ("employee_id", "EMP-1234") in find_leaks(text, cp)
+    # ...and replaced with a category-derived placeholder, consistently.
+    scrubber = Scrubber(_RegexDetector(cp))
+    conv = {"messages": [{"role": "user", "content": text}]}
+    out = json.dumps(scrubber.scrub_conversation(conv, Counter()), ensure_ascii=False)
+    assert "EMP-1234" not in out
+    assert out.count("[EMPLOYEE_ID_1]") == 2  # same value -> same token
+    # And a clean payload no longer leaks the custom pattern.
+    assert find_leaks(out, cp) == []
+
+
+def test_load_custom_patterns(tmp_path):
+    p = tmp_path / "patterns.json"
+    p.write_text(json.dumps([
+        {"category": "employee_id", "pattern": r"EMP-\d{4}"},
+        {"category": "internal_url", "pattern": r"intranet/\w+", "ignore_case": True},
+    ]))
+    pats = load_custom_patterns(str(p))
+    assert [c.category for c in pats] == ["employee_id", "internal_url"]
+    assert pats[0].regex.search("EMP-9999")
+    assert pats[1].regex.search("INTRANET/Foo")  # ignore_case honored
+    # Malformed files are rejected clearly.
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps([{"pattern": "x"}]))  # missing category
+    with pytest.raises(ValueError):
+        load_custom_patterns(str(bad))
+
+
 def test_real_card_next_to_punctuation_still_caught():
     # The identifier guard must not swallow real cards bounded by quotes/punctuation.
     for text in ['"card":"4242424242424242"', "card=4242 4242 4242 4242.", "(4111111111111111)"]:
@@ -321,7 +384,8 @@ def test_wizard_local_file(monkeypatch, tmp_path):
 
     monkeypatch.setattr(m, "PrivacyFilterDetector", lambda *a, **k: StubDetector())
     out = tmp_path / "wiz.jsonl"
-    answers = iter(["1", str(FIXTURE), str(out), "cpu"])  # local; path; output; device
+    # local; path; output; device; mode(pseudonymize); patterns(skip)
+    answers = iter(["1", str(FIXTURE), str(out), "cpu", "1", ""])
     monkeypatch.setattr("builtins.input", lambda *a, **k: next(answers))
     rc = m.main(["--wizard"])
     assert rc == 0

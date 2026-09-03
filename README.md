@@ -32,10 +32,31 @@ export POSTHOG_PROJECT_ID=12345
 uv run orizon-scrub --posthog --window 30d       # -> traces.scrubbed.jsonl
 ```
 
+## Options
+
+```bash
+# Redact instead of pseudonymize: [PERSON] with no numbering, so the same value
+# is indistinguishable from any other (zero within-trace linkage).
+uv run orizon-scrub traces.jsonl --mode redact
+
+# Add your own recognizers (employee ids, internal account formats, ...).
+# They feed both detection and the leak check. See examples/patterns.example.json.
+uv run orizon-scrub traces.jsonl --patterns patterns.json
+
+# Write an audit report of what was stripped (counts only, never values).
+uv run orizon-scrub traces.jsonl --report report.json
+```
+
 ## Good to know
 
 - **Local only** — nothing leaves your machine except the model download and your
-  own PostHog queries.
+  own PostHog queries. See [COMPLIANCE.md](COMPLIANCE.md) for the full data-handling
+  and reviewer notes.
+- **Pseudonymize or redact** — the default keeps consistent numbered placeholders
+  (`[PERSON_1]`) so traces stay analyzable; `--mode redact` drops the numbering for
+  zero linkability.
+- **Extend it** — add domain-specific identifiers with `--patterns`; get an audit
+  trail with `--report`.
 - **Structure is preserved** — roles, tool names, ids, ordering, and token counts
   are untouched; only content is scrubbed, so tool-call JSON still parses and the
   same entity maps to the same placeholder across a conversation.

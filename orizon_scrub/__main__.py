@@ -21,7 +21,13 @@ from collections import Counter
 
 from . import posthog
 from .posthog import Rec
-from .scrub import CATEGORY_PREFIX, PrivacyFilterDetector, Scrubber, find_leaks
+from .scrub import (
+    PrivacyFilterDetector,
+    Scrubber,
+    find_leaks,
+    load_custom_patterns,
+    placeholder_prefix,
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -37,6 +43,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--api-key", default=os.environ.get("POSTHOG_API_KEY"), help="PostHog personal API key, phx_... with query:read (env: POSTHOG_API_KEY).")
     p.add_argument("--project-id", default=os.environ.get("POSTHOG_PROJECT_ID"), help="PostHog project id (env: POSTHOG_PROJECT_ID).")
     p.add_argument("--device", choices=("cpu", "cuda"), default=None, help="Inference device (default: auto-detect).")
+    p.add_argument("--mode", choices=("pseudonymize", "redact"), default="pseudonymize",
+                   help="pseudonymize: consistent numbered tokens ([PERSON_1], linkable within a trace). "
+                        "redact: unnumbered tokens ([PERSON], not linkable). Default: pseudonymize.")
+    p.add_argument("--patterns", default=None,
+                   help="Path to a JSON file of custom recognizers ([{category, pattern, ignore_case?}]). "
+                        "They feed both detection and the leak check.")
+    p.add_argument("--report", default=None,
+                   help="Write a JSON redaction report (counts only, never values) to this path.")
     p.add_argument("--cursor-file", default=".orizon-scrub-cursor.json", help="PostHog resume cursor file (default: .orizon-scrub-cursor.json).")
     p.add_argument("--wizard", action="store_true", help="Interactive setup (also launched when run with no arguments in a terminal).")
     return p
@@ -170,6 +184,20 @@ def run_wizard(args):
         args.output = args.output or _prompt("Output file", default="traces.scrubbed.jsonl")
     dev = _prompt("Device (auto/cpu/cuda)", default=args.device or "auto")
     args.device = None if dev == "auto" else dev
+    mode = _prompt_choice(
+        "Replacement mode",
+        [
+            "Pseudonymize - consistent [PERSON_1] (keeps linkage within a trace)",
+            "Redact - unlinkable [PERSON] (no numbering)",
+        ],
+    )
+    args.mode = "pseudonymize" if mode == 1 else "redact"
+    patterns = _prompt(
+        "Custom patterns JSON file (optional, Enter to skip)",
+        default=args.patterns,
+        validate=os.path.exists,
+    )
+    args.patterns = patterns or args.patterns
     if not _model_cached():
         print("\nNote: the first scrub downloads the ~2.8GB Privacy Filter model to ~/.opf/.")
     print()
@@ -187,7 +215,13 @@ def main(argv=None) -> int:
     records, default_out, commit, append = _source(args)
     out_path = args.output or default_out
 
-    scrubber = Scrubber(PrivacyFilterDetector(device=args.device))
+    try:
+        custom_patterns = load_custom_patterns(args.patterns) if args.patterns else []
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"error: could not load --patterns {args.patterns}: {exc}")
+
+    detector = PrivacyFilterDetector(device=args.device, extra_patterns=custom_patterns)
+    scrubber = Scrubber(detector, mode=args.mode)
     counts: Counter = Counter()
     n_conv = n_incomplete = n_skipped = n_empty = 0
     leaks: dict[str, list] = {}
@@ -211,7 +245,7 @@ def main(argv=None) -> int:
                     n_incomplete += 1
                 scrubbed = scrubber.scrub_conversation(rec.conv, counts)
                 payload = json.dumps(scrubbed, ensure_ascii=False)
-                hits = find_leaks(payload)
+                hits = find_leaks(payload, custom_patterns)
                 if hits:
                     leaks[rec.id] = hits
                 out.write(payload + "\n")
@@ -248,6 +282,9 @@ def main(argv=None) -> int:
             )
         else:
             print(f"\nNo conversations to scrub; nothing written{existing}.")
+        if args.report:
+            _write_report(args.report, args, counts, n_conv, n_incomplete, n_empty,
+                          n_skipped, len(custom_patterns), out_path)
         return 0
 
     try:
@@ -274,8 +311,38 @@ def main(argv=None) -> int:
         _quiet_remove(tmp_path)
         raise
     commit()  # advance the resume cursor only after output is durable
+    if args.report:
+        _write_report(args.report, args, counts, n_conv, n_incomplete, n_empty,
+                      n_skipped, len(custom_patterns), out_path)
     _print_summary(out_path, n_conv, n_incomplete, n_skipped, n_empty, counts)
     return 0
+
+
+def _write_report(path, args, counts, n_conv, n_incomplete, n_empty, n_skipped,
+                  n_custom, out_path) -> None:
+    """Write a JSON redaction report. Counts only: never the redacted values."""
+    from datetime import datetime, timezone
+
+    c = dict(counts)
+    attachments = c.pop("__attachments__", 0)
+    report = {
+        "tool": "orizon-scrub",
+        "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "mode": args.mode,
+        "custom_patterns": n_custom,
+        "conversations_processed": n_conv,
+        "incomplete": n_incomplete,
+        "no_message_content": n_empty,
+        "skipped_malformed": n_skipped,
+        "attachments_removed": attachments,
+        "spans_redacted_total": sum(c.values()),
+        "spans_by_category": {placeholder_prefix(k): v for k, v in sorted(c.items())},
+        "output": out_path if n_conv else None,
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(report, fh, indent=2)
+        fh.write("\n")
+    print(f"  report written          : {path}")
 
 
 def _print_summary(out_path, n_conv, n_incomplete, n_skipped, n_empty, counts) -> None:
@@ -289,7 +356,7 @@ def _print_summary(out_path, n_conv, n_incomplete, n_skipped, n_empty, counts) -
     print(f"  attachments removed     : {attachments}")
     print(f"  spans redacted          : {total_spans}")
     for category in sorted(counts):
-        label = CATEGORY_PREFIX.get(category, category)
+        label = placeholder_prefix(category)
         print(f"      {label:<9} {counts[category]}")
     print(f"  output                  : {out_path}")
 

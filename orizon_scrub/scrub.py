@@ -36,6 +36,18 @@ CATEGORY_PREFIX = {
 
 ATTACHMENT_MARKER = "[ATTACHMENT REMOVED]"
 
+
+def placeholder_prefix(category: str) -> str:
+    """The token prefix used for a category in placeholders and summaries.
+
+    ``private_email`` -> ``EMAIL`` (via the built-in map); an unmapped custom
+    category like ``employee_id`` -> ``EMPLOYEE_ID``.
+    """
+    prefix = CATEGORY_PREFIX.get(category)
+    if prefix is None:
+        prefix = re.sub(r"[^A-Za-z0-9]+", "_", category.upper()).strip("_") or "PII"
+    return prefix
+
 # Content-part types whose payload is binary/media (redact the blob, keep structure).
 # Any other part type (text, thinking, reasoning, unknown) has its string values
 # scrubbed so text-bearing PII is never passed through untouched.
@@ -75,9 +87,11 @@ class PrivacyFilterDetector:
     crashes on CPU-only machines, so the device is always set explicitly.
     """
 
-    def __init__(self, device: str | None = None, biases: dict | None = None):
+    def __init__(self, device: str | None = None, biases: dict | None = None,
+                 extra_patterns=()):
         self._device = device
         self._biases = dict(biases or HIGH_RECALL_BIASES)
+        self._extra_patterns = tuple(extra_patterns)
         self._redactor = None
         self._calib_path: str | None = None
 
@@ -130,7 +144,7 @@ class PrivacyFilterDetector:
         result = self._redactor.redact(text)
         base = result.text
         model_spans = [Span(s.start, s.end, s.label) for s in result.detected_spans]
-        return base, merge_spans(regex_pii_spans(base), model_spans)
+        return base, merge_spans(regex_pii_spans(base, self._extra_patterns), model_spans)
 
 
 class Scrubber:
@@ -142,8 +156,15 @@ class Scrubber:
     names, ids, ordering, token counts, and every other field are left untouched.
     """
 
-    def __init__(self, detector):
+    def __init__(self, detector, mode: str = "pseudonymize"):
         self.detector = detector
+        # "pseudonymize": consistent numbered tokens ([PERSON_1]) that stay linked
+        # within a conversation. "redact": unnumbered tokens ([PERSON]) so the same
+        # value is indistinguishable from any other, removing within-trace linkage
+        # for teams that want zero linkability.
+        if mode not in ("pseudonymize", "redact"):
+            raise ValueError(f"unknown mode {mode!r}; use 'pseudonymize' or 'redact'")
+        self.mode = mode
 
     def scrub_conversation(self, conv: dict, counts: Counter) -> dict:
         """Return a scrubbed deep copy of one OpenAI-chat conversation dict.
@@ -287,6 +308,11 @@ class Scrubber:
         return out
 
     def _placeholder(self, category, value, alias, per_cat) -> str:
+        prefix = placeholder_prefix(category)
+        if self.mode == "redact":
+            # Unnumbered, unlinkable: every value of a category collapses to the
+            # same token, so you cannot tell whether two spans were the same value.
+            return f"[{prefix}]"
         # Normalize to alphanumerics so one entity written in different formats
         # (e.g. a card as "4242 4242..." / "4242-4242..." / "4242...") maps to a
         # single token within the conversation. Fall back to the raw form if the
@@ -296,9 +322,6 @@ class Scrubber:
         token = alias.get(key)
         if token is None:
             per_cat[category] = per_cat.get(category, 0) + 1
-            prefix = CATEGORY_PREFIX.get(category)
-            if prefix is None:
-                prefix = re.sub(r"[^A-Za-z0-9]+", "_", category.upper()).strip("_") or "PII"
             token = f"[{prefix}_{per_cat[category]}]"
             alias[key] = token
         return token
@@ -424,8 +447,49 @@ def merge_spans(primary: list[Span], secondary: list[Span]) -> list[Span]:
     return kept
 
 
-def regex_pii_spans(text: str) -> list[Span]:
-    """High-precision spans for emails, credit cards (Luhn-checked), and secrets."""
+@dataclass(frozen=True)
+class CustomPattern:
+    """A customer-supplied high-precision recognizer: a category and a compiled regex."""
+
+    category: str
+    regex: "re.Pattern"
+
+
+def load_custom_patterns(path: str) -> list[CustomPattern]:
+    """Load extra recognizers from a JSON file.
+
+    Format: a JSON list of objects, each ``{"category": "<name>", "pattern":
+    "<regex>", "ignore_case": <bool, optional>}``. The category names the
+    placeholder prefix (``employee_id`` -> ``[EMPLOYEE_ID_1]``) and the leak-check
+    kind. Because these deterministic patterns feed BOTH detection and the leak
+    check, anything a pattern matches is redacted and, if it ever survives, fails
+    the run. This lets a customer add their own ID or secret formats without code.
+    """
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, list):
+        raise ValueError("custom patterns file must be a JSON list of objects")
+    patterns: list[CustomPattern] = []
+    for i, item in enumerate(data):
+        if not isinstance(item, dict) or "category" not in item or "pattern" not in item:
+            raise ValueError(f"pattern {i} must have 'category' and 'pattern'")
+        flags = re.IGNORECASE if item.get("ignore_case") else 0
+        patterns.append(CustomPattern(str(item["category"]), re.compile(item["pattern"], flags)))
+    return patterns
+
+
+def _custom_spans(text: str, extra_patterns) -> list[Span]:
+    spans: list[Span] = []
+    for cp in extra_patterns or ():
+        for m in cp.regex.finditer(text):
+            if m.end() > m.start():  # ignore zero-width matches
+                spans.append(Span(m.start(), m.end(), cp.category))
+    return spans
+
+
+def regex_pii_spans(text: str, extra_patterns=()) -> list[Span]:
+    """High-precision spans for emails, cards (Luhn-checked), secrets, and any
+    customer-supplied ``extra_patterns``."""
     spans: list[Span] = []
     for m in _EMAIL_RE.finditer(text):
         spans.append(Span(m.start(), m.end(), "private_email"))
@@ -434,11 +498,13 @@ def regex_pii_spans(text: str) -> list[Span]:
             spans.append(Span(m.start(), m.end(), "secret"))
     for start, end in _card_char_spans(text):
         spans.append(Span(start, end, "account_number"))
+    spans.extend(_custom_spans(text, extra_patterns))
     return merge_spans(spans, [])
 
 
-def find_leaks(text: str) -> list[tuple[str, str]]:
-    """Return ``(kind, matched_text)`` for residual emails, cards, or secrets."""
+def find_leaks(text: str, extra_patterns=()) -> list[tuple[str, str]]:
+    """Return ``(kind, matched_text)`` for residual emails, cards, secrets, or
+    customer-supplied ``extra_patterns``."""
     hits: list[tuple[str, str]] = []
     for m in _EMAIL_RE.finditer(text):
         hits.append(("email", m.group()))
@@ -447,4 +513,6 @@ def find_leaks(text: str) -> list[tuple[str, str]]:
             hits.append(("secret", m.group()))
     for start, end in _card_char_spans(text):
         hits.append(("card", text[start:end]))
+    for sp in _custom_spans(text, extra_patterns):
+        hits.append((sp.category, text[sp.start:sp.end]))
     return hits
