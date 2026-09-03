@@ -68,13 +68,38 @@ def build_query_url(host: str, project_id: str) -> str:
     return f"{host.rstrip('/')}/api/projects/{project_id}/query/"
 
 
+def normalize_ts(ts: str) -> str:
+    """Normalize a timestamp to ClickHouse ``toDateTime64(_, 3)`` form.
+
+    PostHog returns event timestamps as ISO strings like
+    ``2026-09-02T08:22:22.135000Z`` (a ``T`` separator, a ``Z`` suffix, and six
+    fractional digits). ``toDateTime64('...', 3)`` cannot parse that shape and the
+    query 500s with a ClickHouse error, so every resumed pull and every page after
+    the first would fail. We rewrite it to ``2026-09-02 08:22:22.135`` (space
+    separator, milliseconds), which ``toDateTime64`` accepts while keeping the
+    sub-second precision the ``(timestamp, uuid)`` keyset relies on. The epoch
+    sentinel is already in this form and passes through unchanged.
+    """
+    s = ts.strip().replace("T", " ")
+    if s.endswith("Z"):
+        s = s[:-1].strip()
+    if "." in s:
+        head, frac = s.split(".", 1)
+        s = f"{head}.{(frac + '000')[:3]}"  # pad or truncate to milliseconds
+    else:
+        s = f"{s}.000"
+    return s
+
+
 def build_hogql(amount: int, unit: str, cur_ts: str, cur_uuid: str, limit: int) -> str:
     """Build a keyset-paginated HogQL query for one page of $ai_generation events.
 
     ``cur_ts``/``cur_uuid`` come from PostHog's own response (or the epoch sentinel),
-    so they are trusted; single quotes are still escaped defensively.
+    so they are trusted; single quotes are still escaped defensively. ``cur_ts`` is
+    normalized to a ``toDateTime64``-parseable form first (PostHog's own ISO
+    timestamps are not directly parseable and would 500).
     """
-    ts = cur_ts.replace("'", "''")
+    ts = normalize_ts(cur_ts).replace("'", "''")
     uid = cur_uuid.replace("'", "''")
     columns = ",\n       ".join(_SELECT_COLUMNS)
     # Keyset predicate. On the first pull the cursor is the epoch sentinel with an
@@ -121,18 +146,41 @@ def save_cursor(path: str, ts: str, uuid: str) -> None:
     os.replace(tmp, path)
 
 
-def _http_query(url, headers, body, timeout=120):  # pragma: no cover - needs network
+def _http_query(url, headers, body, timeout=120, retries=4, backoff=1.0, sleep=None):  # pragma: no cover - needs network
+    """POST one HogQL query, retrying transient failures.
+
+    The eu.posthog.com query API intermittently answers a cold query with
+    ``500 ... ClickHouse error while executing query.`` that clears on retry
+    within seconds. Retry on 429 and 5xx and on connection/timeout errors with
+    exponential backoff; surface 4xx (bad query, auth, missing scope) at once
+    because those are deterministic. On the final attempt raise as before.
+    """
+    import time
+
     import requests
 
-    resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
-    if resp.status_code >= 400:
-        # Surface PostHog's error body — it names the offending query/field,
-        # which a bare raise_for_status() throws away.
-        detail = resp.text[:1000]
-        raise requests.exceptions.HTTPError(
-            f"{resp.status_code} from PostHog query API: {detail}", response=resp
-        )
-    return resp.json()
+    sleep = sleep or time.sleep
+    last_exc: Exception | None = None
+    for attempt in range(retries):
+        try:
+            resp = requests.post(url, headers=headers, data=json.dumps(body), timeout=timeout)
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_exc = exc
+        else:
+            if resp.status_code < 400:
+                return resp.json()
+            # Surface PostHog's error body — it names the offending query/field,
+            # which a bare raise_for_status() throws away.
+            detail = resp.text[:1000]
+            exc = requests.exceptions.HTTPError(
+                f"{resp.status_code} from PostHog query API: {detail}", response=resp
+            )
+            if resp.status_code != 429 and resp.status_code < 500:
+                raise exc  # deterministic client error; do not retry
+            last_exc = exc
+        if attempt < retries - 1:
+            sleep(backoff * (2 ** attempt))
+    raise last_exc
 
 
 def fetch_rows(

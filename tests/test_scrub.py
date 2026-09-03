@@ -230,11 +230,32 @@ def test_dict_shaped_content_is_scrubbed():
 
 def test_fused_card_is_detected():
     # A Luhn-valid card fused to adjacent digits must still be caught (no over-consume).
-    text = "order991234567890123452 shipped"  # 1234567890123452 is Luhn-valid
+    text = "amount 991234567890123452 usd"  # 1234567890123452 is Luhn-valid
     spans = [s for s in regex_pii_spans(text) if s.category == "account_number"]
     assert spans, "fused card not detected"
     assert "1234567890123452" in text[spans[0].start:spans[0].end]
     assert find_leaks(text)  # and the leak net also catches it
+
+
+def test_digit_run_inside_identifier_is_not_a_card():
+    # A hex trace id holds a Luhn-valid substring but is a structural field, never
+    # a card. A run flanked by an ASCII letter must not be flagged (this is the
+    # ORI-141 false positive that aborted every PostHog pull).
+    trace_id = "039626639469462ca37adcb9810f3724"  # contains Luhn-valid 9626639469462
+    assert find_leaks(trace_id) == []
+    assert [s for s in regex_pii_spans(trace_id) if s.category == "account_number"] == []
+    call_id = "call_039626639469462ca37adcb9810f3724_0_0"
+    assert find_leaks(call_id) == []
+    # And embedded in a serialized empty conversation (the exact failing payload).
+    payload = json.dumps({"trace_id": trace_id, "messages": []}, ensure_ascii=False)
+    assert find_leaks(payload) == []
+
+
+def test_real_card_next_to_punctuation_still_caught():
+    # The identifier guard must not swallow real cards bounded by quotes/punctuation.
+    for text in ['"card":"4242424242424242"', "card=4242 4242 4242 4242.", "(4111111111111111)"]:
+        assert find_leaks(text), text
+        assert [s for s in regex_pii_spans(text) if s.category == "account_number"], text
 
 
 def test_attachment_preserves_metadata_enums():

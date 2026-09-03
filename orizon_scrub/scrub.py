@@ -360,14 +360,36 @@ def _luhn_ok(digits: str) -> bool:
     return total % 10 == 0
 
 
+def _is_ascii_letter(ch: str) -> bool:
+    return ch.isascii() and ch.isalpha()
+
+
+def _letter_adjacent(text: str, start: int, end: int) -> bool:
+    """True if an ASCII letter immediately precedes ``start`` or follows ``end``.
+
+    A digit run flanked by a letter is part of an alphanumeric identifier (a hex
+    trace id, a base64 token), not a standalone card number. Real cards in prose
+    or JSON are bounded by whitespace, quotes, or punctuation instead.
+    """
+    before = text[start - 1] if start > 0 else ""
+    after = text[end] if end < len(text) else ""
+    return _is_ascii_letter(before) or _is_ascii_letter(after)
+
+
 def _card_char_spans(text: str) -> list[tuple[int, int]]:
     """Character spans of Luhn-valid 13-19 digit card numbers within ``text``.
 
     Scans each maximal digit run for the longest, earliest Luhn-valid window so a
-    card adjacent to other digits is still located precisely.
+    card adjacent to other digits is still located precisely. Runs embedded in an
+    alphanumeric identifier (letter on either side) are skipped: a hex trace id
+    such as ``039626639469462ca...`` holds a Luhn-valid substring but is not a
+    card, and it is a structural field the scrubber never touches, so matching it
+    would both over-redact and trip the leak check on every conversation.
     """
     spans: list[tuple[int, int]] = []
     for m in _DIGIT_RUN_RE.finditer(text):
+        if _letter_adjacent(text, m.start(), m.end()):
+            continue
         run = m.group()
         idx = [i for i, ch in enumerate(run) if ch.isdigit()]
         digits = "".join(run[i] for i in idx)

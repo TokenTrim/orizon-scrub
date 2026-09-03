@@ -11,3 +11,5 @@ venv/
 *.scrubbed.jsonl
 .orizon-scrub-cursor.json
 .DS_Store
+# Local PostHog credentials (personal API key); never commit.
+.posthog-keys

@@ -42,6 +42,12 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _has_messages(conv: dict) -> bool:
+    """True when a conversation carries at least one message to scrub."""
+    messages = conv.get("messages") if isinstance(conv, dict) else None
+    return isinstance(messages, list) and len(messages) > 0
+
+
 def default_output_path(input_path: str) -> str:
     if input_path.endswith(".jsonl"):
         return input_path[: -len(".jsonl")] + ".scrubbed.jsonl"
@@ -183,7 +189,7 @@ def main(argv=None) -> int:
 
     scrubber = Scrubber(PrivacyFilterDetector(device=args.device))
     counts: Counter = Counter()
-    n_conv = n_incomplete = n_skipped = 0
+    n_conv = n_incomplete = n_skipped = n_empty = 0
     leaks: dict[str, list] = {}
 
     out_dir = os.path.dirname(os.path.abspath(out_path))
@@ -194,6 +200,12 @@ def main(argv=None) -> int:
                 if rec.skipped:
                     n_skipped += 1
                     print(f"  skipped {rec.id}: {rec.reason}", file=sys.stderr)
+                    continue
+                if not _has_messages(rec.conv):
+                    # Metadata-only traces (e.g. a PostHog project that does not
+                    # capture $ai_input) stitch to zero messages. There is nothing
+                    # to scrub, so do not write an empty line for them.
+                    n_empty += 1
                     continue
                 if rec.incomplete:
                     n_incomplete += 1
@@ -222,11 +234,20 @@ def main(argv=None) -> int:
         return 1
 
     if n_conv == 0:
-        # Never overwrite an existing good output with an empty file, and do not
-        # advance the cursor (nothing was committed).
+        # Never overwrite an existing good output with an empty file.
         _quiet_remove(tmp_path)
         existing = " (existing output left unchanged)" if os.path.exists(out_path) else ""
-        print(f"\nNo conversations to scrub; nothing written{existing}.")
+        if n_empty:
+            # These traces were fetched and fully handled (no content to scrub), so
+            # advance the cursor past them; otherwise a metadata-only project would
+            # re-pull the same empty traces on every run and never make progress.
+            commit()
+            print(
+                f"\n{n_empty} trace(s) had no message content (the project may "
+                f"capture metadata only); nothing to scrub{existing}."
+            )
+        else:
+            print(f"\nNo conversations to scrub; nothing written{existing}.")
         return 0
 
     try:
@@ -253,16 +274,17 @@ def main(argv=None) -> int:
         _quiet_remove(tmp_path)
         raise
     commit()  # advance the resume cursor only after output is durable
-    _print_summary(out_path, n_conv, n_incomplete, n_skipped, counts)
+    _print_summary(out_path, n_conv, n_incomplete, n_skipped, n_empty, counts)
     return 0
 
 
-def _print_summary(out_path, n_conv, n_incomplete, n_skipped, counts) -> None:
+def _print_summary(out_path, n_conv, n_incomplete, n_skipped, n_empty, counts) -> None:
     attachments = counts.pop("__attachments__", 0)
     total_spans = sum(counts.values())
     print("\norizon-scrub summary")
     print(f"  conversations processed : {n_conv}")
     print(f"  incomplete/partial      : {n_incomplete}")
+    print(f"  no message content      : {n_empty}")
     print(f"  skipped (malformed)     : {n_skipped}")
     print(f"  attachments removed     : {attachments}")
     print(f"  spans redacted          : {total_spans}")

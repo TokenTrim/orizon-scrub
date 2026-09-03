@@ -70,6 +70,26 @@ def test_build_hogql_has_keyset_and_window():
     assert "OFFSET" not in sql  # OFFSET paging is rejected by PostHog for personal keys
 
 
+def test_normalize_ts_handles_posthog_iso_and_epoch():
+    from orizon_scrub.posthog import normalize_ts
+
+    # PostHog's own ISO form -> toDateTime64-parseable millisecond form.
+    assert normalize_ts("2026-09-02T08:22:22.135000Z") == "2026-09-02 08:22:22.135"
+    # Epoch sentinel and already-normalized values are unchanged (idempotent).
+    assert normalize_ts("1970-01-01 00:00:00.000") == "1970-01-01 00:00:00.000"
+    assert normalize_ts("2026-09-02 08:22:22.135") == "2026-09-02 08:22:22.135"
+    # No fractional part -> .000 added.
+    assert normalize_ts("2026-09-02T08:22:22Z") == "2026-09-02 08:22:22.000"
+
+
+def test_build_hogql_normalizes_iso_cursor():
+    # A resumed pull carries PostHog's ISO timestamp; the query must embed the
+    # normalized form, never the raw 'T'/'Z' form that 500s ClickHouse.
+    sql = build_hogql(30, "DAY", "2026-09-02T08:22:22.135000Z", "u1", 5000)
+    assert "toDateTime64('2026-09-02 08:22:22.135', 3)" in sql
+    assert "2026-09-02T08:22:22.135000Z" not in sql
+
+
 def test_build_hogql_first_pull_has_no_uuid_string_compare():
     # Epoch sentinel with an empty uuid: comparing the UUID column to '' is a
     # HogQL type error (HTTP 400), so the first pull must be timestamp-only.
@@ -105,8 +125,11 @@ def test_fetch_rows_pagination_and_final_cursor():
     )
     assert [x["uuid"] for x in rows] == ["u1", "u2", "u3"]
     assert final == ("2026-09-01T00:00:02Z", "u3")  # last row seen
-    # Second page query resumed from the first page's last row.
-    assert "u2" in fake.hogql(1) and "2026-09-01T00:00:01Z" in fake.hogql(1)
+    # Second page query resumed from the first page's last row, with the ISO
+    # timestamp normalized to a toDateTime64-parseable form (ORI-141: the raw
+    # 'T'/'Z' form 500s in ClickHouse, which broke every page after the first).
+    assert "u2" in fake.hogql(1) and "2026-09-01 00:00:01.000" in fake.hogql(1)
+    assert "2026-09-01T00:00:01Z" not in fake.hogql(1)
 
 
 def test_fetch_rows_resumes_from_start_cursor():
@@ -254,6 +277,31 @@ def test_main_commits_cursor_only_after_success(monkeypatch, tmp_path):
     assert json.loads(cursor.read_text()) == {"ts": "2026-09-01T00:00:00Z", "uuid": "a"}
 
 
+def test_main_skips_traces_with_no_messages(monkeypatch, tmp_path):
+    # Metadata-only projects (no $ai_input) stitch to empty conversations. They must
+    # not be written and must not trip the leak check via their trace id (ORI-141).
+    recs = [
+        Rec(id="039626639469462ca37adcb9810f3724",
+            conv={"trace_id": "039626639469462ca37adcb9810f3724", "messages": []},
+            incomplete=True),
+        Rec(id="t2", conv={"trace_id": "t2", "messages": [{"role": "user", "content": "hi"}]}),
+    ]
+    rc, cursor, out = _run_posthog_main(monkeypatch, tmp_path, recs, ("2026-09-01T00:00:00Z", "a"))
+    assert rc == 0
+    lines = [json.loads(x) for x in out.read_text().splitlines() if x.strip()]
+    assert [c["trace_id"] for c in lines] == ["t2"]  # empty trace dropped, content kept
+
+
+def test_main_all_empty_exits_zero_and_commits_cursor(monkeypatch, tmp_path):
+    # An all-metadata pull is a clean success: no file written, but the cursor
+    # advances so the same empty traces are not re-pulled forever.
+    recs = [Rec(id="e1", conv={"trace_id": "e1", "messages": []}, incomplete=True)]
+    rc, cursor, out = _run_posthog_main(monkeypatch, tmp_path, recs, ("2026-09-05T00:00:00Z", "z"))
+    assert rc == 0
+    assert not out.exists()
+    assert json.loads(cursor.read_text()) == {"ts": "2026-09-05T00:00:00Z", "uuid": "z"}
+
+
 def test_main_does_not_commit_cursor_on_leak(monkeypatch, tmp_path):
     # Blind detector leaves an email -> leak check fails -> no output, no cursor.
     recs = [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "mail a@b.com"}]})]
@@ -340,3 +388,51 @@ def test_main_empty_pull_does_not_overwrite_existing_output(monkeypatch, tmp_pat
     assert rc == 0
     assert out.read_text() == "PREVIOUS GOOD OUTPUT\n"  # not clobbered by empty result
     assert not cursor.exists()
+
+
+# -- transient-error retry (ORI-141) ----------------------------------------
+
+class _Resp:
+    def __init__(self, code, payload=None, text="err"):
+        self.status_code = code
+        self._payload = payload or {}
+        self.text = text
+
+    def json(self):
+        return self._payload
+
+
+def test_http_query_retries_transient_5xx(monkeypatch):
+    # A cold ClickHouse 500 that clears on retry must not abort the pull.
+    import requests
+
+    from orizon_scrub import posthog as ph
+
+    ok = {"columns": ["x"], "results": [[1]]}
+    calls = {"n": 0}
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        calls["n"] += 1
+        return _Resp(500) if calls["n"] < 3 else _Resp(200, ok)
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    assert ph._http_query("u", {}, {"query": {}}, sleep=lambda _s: None) == ok
+    assert calls["n"] == 3
+
+
+def test_http_query_does_not_retry_4xx(monkeypatch):
+    # A deterministic 400 (bad query / auth / scope) must surface immediately.
+    import requests
+
+    from orizon_scrub import posthog as ph
+
+    calls = {"n": 0}
+
+    def fake_post(url, headers=None, data=None, timeout=None):
+        calls["n"] += 1
+        return _Resp(400, text="bad query")
+
+    monkeypatch.setattr(requests, "post", fake_post)
+    with pytest.raises(requests.exceptions.HTTPError):
+        ph._http_query("u", {}, {"query": {}}, sleep=lambda _s: None)
+    assert calls["n"] == 1
