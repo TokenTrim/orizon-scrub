@@ -69,26 +69,27 @@ def build_query_url(host: str, project_id: str) -> str:
 
 
 def normalize_ts(ts: str) -> str:
-    """Normalize a timestamp to ClickHouse ``toDateTime64(_, 3)`` form.
+    """Normalize a timestamp to ClickHouse ``toDateTime64(_, 6)`` form.
 
     PostHog returns event timestamps as ISO strings like
-    ``2026-09-02T08:22:22.135000Z`` (a ``T`` separator, a ``Z`` suffix, and six
-    fractional digits). ``toDateTime64('...', 3)`` cannot parse that shape and the
-    query 500s with a ClickHouse error, so every resumed pull and every page after
-    the first would fail. We rewrite it to ``2026-09-02 08:22:22.135`` (space
-    separator, milliseconds), which ``toDateTime64`` accepts while keeping the
-    sub-second precision the ``(timestamp, uuid)`` keyset relies on. The epoch
+    ``2026-09-02T08:22:22.135000Z`` (a ``T`` separator, a ``Z`` suffix, and up to
+    six fractional digits). ``toDateTime64('...', N)`` cannot parse that shape and
+    the query 500s with a ClickHouse error, so every resumed pull and every page
+    after the first would fail. We rewrite it to ``2026-09-02 08:22:22.135000``
+    (space separator, microseconds), which ``toDateTime64`` accepts.
+
+    The full fractional part is preserved (padded to at least milliseconds). This
+    matters for the ``(timestamp, uuid)`` keyset: truncating to milliseconds when a
+    timestamp carries microseconds would make ``timestamp > <truncated>`` re-select
+    the very row the cursor came from, duplicating it across pages. The epoch
     sentinel is already in this form and passes through unchanged.
     """
     s = ts.strip().replace("T", " ")
     if s.endswith("Z"):
         s = s[:-1].strip()
-    if "." in s:
-        head, frac = s.split(".", 1)
-        s = f"{head}.{(frac + '000')[:3]}"  # pad or truncate to milliseconds
-    else:
-        s = f"{s}.000"
-    return s
+    head, _, frac = s.partition(".")
+    frac = "".join(c for c in frac if c.isdigit())[:6]  # up to microseconds
+    return f"{head.strip()}.{(frac or '0').ljust(3, '0')}"
 
 
 def build_hogql(amount: int, unit: str, cur_ts: str, cur_uuid: str, limit: int) -> str:
@@ -106,8 +107,9 @@ def build_hogql(amount: int, unit: str, cur_ts: str, cur_uuid: str, limit: int) 
     # empty uuid; comparing the UUID-typed `uuid` column against '' is a type error
     # in HogQL/ClickHouse (HTTP 400), so fall back to a timestamp-only bound then.
     # `uuid` is cast to string for a well-defined tie-break comparison, and the
-    # timestamp sentinel is parsed with toDateTime64 to accept the millisecond form.
-    lo = f"toDateTime64('{ts}', 3)"
+    # timestamp sentinel is parsed with toDateTime64 at microsecond scale so a
+    # sub-millisecond cursor is compared exactly, not truncated.
+    lo = f"toDateTime64('{ts}', 6)"
     if uid:
         keyset = (
             f"  AND ((timestamp > {lo}) "
@@ -223,9 +225,14 @@ def fetch_rows(
             break
         for row in rows:
             rows_out.append(dict(zip(columns, row)))
+        prev_ts, prev_uuid = cur_ts, cur_uuid
         cur_ts = str(rows_out[-1].get("timestamp", cur_ts))
         cur_uuid = str(rows_out[-1].get("uuid", cur_uuid))
         if len(rows) < limit:
+            break
+        # Safety net: the keyset must strictly advance every page (uuid is unique).
+        # If it does not, stop rather than re-query the same page forever.
+        if (cur_ts, cur_uuid) == (prev_ts, prev_uuid):
             break
 
     final = (cur_ts, cur_uuid) if rows_out else None

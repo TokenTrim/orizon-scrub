@@ -310,11 +310,42 @@ def test_load_custom_patterns(tmp_path):
     assert [c.category for c in pats] == ["employee_id", "internal_url"]
     assert pats[0].regex.search("EMP-9999")
     assert pats[1].regex.search("INTRANET/Foo")  # ignore_case honored
-    # Malformed files are rejected clearly.
+    # Malformed files are rejected clearly (ValueError, not a raw traceback).
     bad = tmp_path / "bad.json"
     bad.write_text(json.dumps([{"pattern": "x"}]))  # missing category
     with pytest.raises(ValueError):
         load_custom_patterns(str(bad))
+    # A non-string pattern must raise ValueError, not TypeError from re.compile.
+    typed = tmp_path / "typed.json"
+    typed.write_text(json.dumps([{"category": "x", "pattern": None}]))
+    with pytest.raises(ValueError):
+        load_custom_patterns(str(typed))
+    # An invalid regex is a clear ValueError too.
+    rx = tmp_path / "rx.json"
+    rx.write_text(json.dumps([{"category": "x", "pattern": "("}]))
+    with pytest.raises(ValueError):
+        load_custom_patterns(str(rx))
+
+
+def test_card_glued_to_word_is_still_caught():
+    # ORI-141 review: the identifier guard must not suppress a real card that
+    # touches a word. A clean alphabetic prefix/suffix around a pure digit block
+    # is a card; only interspersed letters (hex/base64) mark an identifier.
+    for text in ["card4242424242424242", "4242424242424242is valid", "x4111111111111111"]:
+        assert find_leaks(text), text
+        assert [s for s in regex_pii_spans(text) if s.category == "account_number"], text
+    # A hex identifier (letters interspersed among the digits) is still not a card.
+    assert find_leaks("039626639469462ca37adcb9810f3724") == []
+
+
+def test_custom_pattern_does_not_leak_on_its_own_placeholder():
+    # A broad recognizer must not flag the digits of the placeholder it produced.
+    cp = [CustomPattern("number", re.compile(r"\d+"))]
+    scrubber = Scrubber(_RegexDetector(cp))
+    conv = {"messages": [{"role": "user", "content": "ref 5551234 please"}]}
+    out = json.dumps(scrubber.scrub_conversation(conv, Counter()), ensure_ascii=False)
+    assert "5551234" not in out and "[NUMBER_1]" in out
+    assert find_leaks(out, cp) == []  # the '1' inside [NUMBER_1] is not a leak
 
 
 def test_gen_pii_produces_wellformed_pii_conversations():

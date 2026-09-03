@@ -63,7 +63,7 @@ def test_build_hogql_has_keyset_and_window():
     sql = build_hogql(30, "DAY", "2026-08-01 00:00:00.000", "abc", 5000)
     assert "INTERVAL 30 DAY" in sql
     assert "event = '$ai_generation'" in sql
-    assert "toDateTime64('2026-08-01 00:00:00.000', 3)" in sql
+    assert "toDateTime64('2026-08-01 00:00:00.000', 6)" in sql
     assert "toString(uuid) > 'abc'" in sql
     assert "ORDER BY timestamp ASC, toString(uuid) ASC" in sql
     assert "LIMIT 5000" in sql
@@ -73,12 +73,15 @@ def test_build_hogql_has_keyset_and_window():
 def test_normalize_ts_handles_posthog_iso_and_epoch():
     from orizon_scrub.posthog import normalize_ts
 
-    # PostHog's own ISO form -> toDateTime64-parseable millisecond form.
-    assert normalize_ts("2026-09-02T08:22:22.135000Z") == "2026-09-02 08:22:22.135"
+    # PostHog's own ISO form -> toDateTime64-parseable form, full precision kept.
+    assert normalize_ts("2026-09-02T08:22:22.135000Z") == "2026-09-02 08:22:22.135000"
+    # Sub-millisecond precision is preserved (not truncated to ms), so a keyset
+    # cursor on such a row is compared exactly and not re-selected.
+    assert normalize_ts("2026-09-02T08:22:22.135999Z") == "2026-09-02 08:22:22.135999"
     # Epoch sentinel and already-normalized values are unchanged (idempotent).
     assert normalize_ts("1970-01-01 00:00:00.000") == "1970-01-01 00:00:00.000"
     assert normalize_ts("2026-09-02 08:22:22.135") == "2026-09-02 08:22:22.135"
-    # No fractional part -> .000 added.
+    # No fractional part -> milliseconds added.
     assert normalize_ts("2026-09-02T08:22:22Z") == "2026-09-02 08:22:22.000"
 
 
@@ -86,7 +89,7 @@ def test_build_hogql_normalizes_iso_cursor():
     # A resumed pull carries PostHog's ISO timestamp; the query must embed the
     # normalized form, never the raw 'T'/'Z' form that 500s ClickHouse.
     sql = build_hogql(30, "DAY", "2026-09-02T08:22:22.135000Z", "u1", 5000)
-    assert "toDateTime64('2026-09-02 08:22:22.135', 3)" in sql
+    assert "toDateTime64('2026-09-02 08:22:22.135000', 6)" in sql
     assert "2026-09-02T08:22:22.135000Z" not in sql
 
 
@@ -96,7 +99,7 @@ def test_build_hogql_first_pull_has_no_uuid_string_compare():
     sql = build_hogql(30, "DAY", "1970-01-01 00:00:00.000", "", 5000)
     assert "uuid > ''" not in sql
     assert "toString(uuid) > ''" not in sql
-    assert "timestamp > toDateTime64('1970-01-01 00:00:00.000', 3)" in sql
+    assert "timestamp > toDateTime64('1970-01-01 00:00:00.000', 6)" in sql
 
 
 # -- cursor round-trip ------------------------------------------------------
@@ -285,6 +288,51 @@ def test_main_writes_report(monkeypatch, tmp_path):
     assert data["conversations_processed"] == 1
     assert data["spans_redacted_total"] == 0  # blind detector, no spans
     assert "spans_by_category" in data and "generated_at" in data
+
+
+def test_report_path_collision_rejected(monkeypatch, tmp_path):
+    # --report must not clobber the output or the PostHog cursor (ORI-141 review).
+    recs = [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "hi"}]})]
+    out_path = tmp_path / "out.jsonl"
+    with pytest.raises(SystemExit):
+        _run_posthog_main(monkeypatch, tmp_path, recs, ("2026-09-01T00:00:00Z", "a"),
+                          extra_args=["--report", str(out_path)])  # == -o
+    with pytest.raises(SystemExit):
+        _run_posthog_main(monkeypatch, tmp_path, recs, ("2026-09-01T00:00:00Z", "a"),
+                          extra_args=["--report", str(tmp_path / "cur.json")])  # == cursor
+
+
+def test_local_empty_conversation_is_not_dropped(monkeypatch, tmp_path):
+    # The empty-trace skip is PostHog-only; a local file is passed through as-is.
+    import orizon_scrub.__main__ as m
+
+    monkeypatch.setattr(m, "PrivacyFilterDetector", _Blind)
+    inp = tmp_path / "in.jsonl"
+    inp.write_text(
+        json.dumps({"id": "a", "messages": []}) + "\n"
+        + json.dumps({"id": "b", "messages": [{"role": "user", "content": "hi"}]}) + "\n"
+    )
+    out = tmp_path / "in.scrubbed.jsonl"
+    rc = m.main([str(inp), "-o", str(out)])
+    assert rc == 0
+    ids = [json.loads(x)["id"] for x in out.read_text().splitlines() if x.strip()]
+    assert ids == ["a", "b"]  # empty local conversation preserved
+
+
+def test_fetch_rows_stops_when_cursor_does_not_advance():
+    # Safety net against an infinite loop if a full page never advances the keyset.
+    row = {"uuid": "u0", "timestamp": "2026-01-01 00:00:00.000", "trace_id": "t", "input": "[]"}
+    page = {"columns": COLUMNS, "results": [[row.get(c) for c in COLUMNS]] * 2}
+    calls = {"n": 0}
+
+    def always_same(url, headers, body):
+        calls["n"] += 1
+        assert calls["n"] < 5, "fetch_rows looped instead of stopping"
+        return page  # full page, last row == start cursor -> no advance
+
+    rows, final = fetch_rows("h", "1", "k", "30d",
+                             ("2026-01-01 00:00:00.000", "u0"), limit=2, query_fn=always_same)
+    assert calls["n"] == 1
 
 
 def test_main_bad_patterns_file_errors(monkeypatch, tmp_path):

@@ -387,33 +387,57 @@ def _is_ascii_letter(ch: str) -> bool:
     return ch.isascii() and ch.isalpha()
 
 
-def _letter_adjacent(text: str, start: int, end: int) -> bool:
-    """True if an ASCII letter immediately precedes ``start`` or follows ``end``.
+def _looks_like_identifier(text: str, start: int, end: int, run: str) -> bool:
+    """True when the digit run at ``[start, end)`` is a fragment of an identifier
+    (a hex trace id, a base64 token) rather than a card number.
 
-    A digit run flanked by a letter is part of an alphanumeric identifier (a hex
-    trace id, a base64 token), not a standalone card number. Real cards in prose
-    or JSON are bounded by whitespace, quotes, or punctuation instead.
+    Only runs directly touching an ASCII letter are candidates: a card in prose or
+    JSON is bounded by whitespace, quotes, or punctuation. A run written with
+    internal separators (``4242 4242 ...``) is a formatted card, never an id. For a
+    contiguous run glued to letters, inspect the enclosing alphanumeric token: if,
+    after removing a single leading and trailing alphabetic run, letters remain
+    interspersed among the digits, it is hex/base64 (e.g. ``039626639469462ca...``)
+    and skipped; a clean word wrapped around a pure digit block (``card4242...4242``)
+    is left for the Luhn check so real cards are never dropped.
     """
     before = text[start - 1] if start > 0 else ""
     after = text[end] if end < len(text) else ""
-    return _is_ascii_letter(before) or _is_ascii_letter(after)
+    if not (_is_ascii_letter(before) or _is_ascii_letter(after)):
+        return False
+    if any(c in " -" for c in run):
+        return False
+    left = start
+    while left > 0 and text[left - 1].isascii() and text[left - 1].isalnum():
+        left -= 1
+    right = end
+    while right < len(text) and text[right].isascii() and text[right].isalnum():
+        right += 1
+    token = text[left:right]
+    i = 0
+    while i < len(token) and _is_ascii_letter(token[i]):
+        i += 1
+    j = len(token)
+    while j > i and _is_ascii_letter(token[j - 1]):
+        j -= 1
+    return any(_is_ascii_letter(c) for c in token[i:j])
 
 
 def _card_char_spans(text: str) -> list[tuple[int, int]]:
     """Character spans of Luhn-valid 13-19 digit card numbers within ``text``.
 
     Scans each maximal digit run for the longest, earliest Luhn-valid window so a
-    card adjacent to other digits is still located precisely. Runs embedded in an
-    alphanumeric identifier (letter on either side) are skipped: a hex trace id
-    such as ``039626639469462ca...`` holds a Luhn-valid substring but is not a
-    card, and it is a structural field the scrubber never touches, so matching it
-    would both over-redact and trip the leak check on every conversation.
+    card adjacent to other digits is still located precisely. Runs that are a
+    fragment of an alphanumeric identifier are skipped (see
+    :func:`_looks_like_identifier`): a hex trace id such as
+    ``039626639469462ca...`` holds a Luhn-valid substring but is not a card, and it
+    is a structural field the scrubber never touches, so matching it would both
+    over-redact and trip the leak check on every conversation.
     """
     spans: list[tuple[int, int]] = []
     for m in _DIGIT_RUN_RE.finditer(text):
-        if _letter_adjacent(text, m.start(), m.end()):
-            continue
         run = m.group()
+        if _looks_like_identifier(text, m.start(), m.end(), run):
+            continue
         idx = [i for i, ch in enumerate(run) if ch.isdigit()]
         digits = "".join(run[i] for i in idx)
         n = len(digits)
@@ -473,8 +497,15 @@ def load_custom_patterns(path: str) -> list[CustomPattern]:
     for i, item in enumerate(data):
         if not isinstance(item, dict) or "category" not in item or "pattern" not in item:
             raise ValueError(f"pattern {i} must have 'category' and 'pattern'")
-        flags = re.IGNORECASE if item.get("ignore_case") else 0
-        patterns.append(CustomPattern(str(item["category"]), re.compile(item["pattern"], flags)))
+        category, pattern = item["category"], item["pattern"]
+        if not isinstance(category, str) or not isinstance(pattern, str):
+            raise ValueError(f"pattern {i}: 'category' and 'pattern' must be strings")
+        try:
+            flags = re.IGNORECASE if item.get("ignore_case") else 0
+            compiled = re.compile(pattern, flags)
+        except re.error as exc:
+            raise ValueError(f"pattern {i}: invalid regex: {exc}") from exc
+        patterns.append(CustomPattern(category, compiled))
     return patterns
 
 
@@ -502,9 +533,20 @@ def regex_pii_spans(text: str, extra_patterns=()) -> list[Span]:
     return merge_spans(spans, [])
 
 
+# A generated replacement token: [PERSON], [EMAIL_1], [EMPLOYEE_ID_2], ...
+_PLACEHOLDER_RE = re.compile(r"\[[A-Z][A-Z0-9_]*\]")
+
+
 def find_leaks(text: str, extra_patterns=()) -> list[tuple[str, str]]:
     """Return ``(kind, matched_text)`` for residual emails, cards, secrets, or
-    customer-supplied ``extra_patterns``."""
+    customer-supplied ``extra_patterns``.
+
+    A custom pattern match that falls entirely inside a generated placeholder (for
+    example ``\\d+`` matching the ``1`` in ``[EMPLOYEE_ID_1]``) is not a leak: the
+    original value was removed. Such matches are ignored so a broad recognizer
+    cannot make every run fail its own leak check. The built-in email/card/secret
+    patterns never match a placeholder, so they scan the whole text unchanged.
+    """
     hits: list[tuple[str, str]] = []
     for m in _EMAIL_RE.finditer(text):
         hits.append(("email", m.group()))
@@ -513,6 +555,9 @@ def find_leaks(text: str, extra_patterns=()) -> list[tuple[str, str]]:
             hits.append(("secret", m.group()))
     for start, end in _card_char_spans(text):
         hits.append(("card", text[start:end]))
-    for sp in _custom_spans(text, extra_patterns):
-        hits.append((sp.category, text[sp.start:sp.end]))
+    if extra_patterns:
+        holes = [(m.start(), m.end()) for m in _PLACEHOLDER_RE.finditer(text)]
+        for sp in _custom_spans(text, extra_patterns):
+            if not any(hs <= sp.start and sp.end <= he for hs, he in holes):
+                hits.append((sp.category, text[sp.start:sp.end]))
     return hits

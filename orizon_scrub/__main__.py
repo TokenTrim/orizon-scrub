@@ -220,6 +220,14 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         raise SystemExit(f"error: could not load --patterns {args.patterns}: {exc}")
 
+    if args.report:
+        conflict = _report_path_conflict(args, out_path)
+        if conflict:
+            raise SystemExit(
+                f"error: --report path is the same file as the {conflict}; "
+                "choose a different --report path"
+            )
+
     detector = PrivacyFilterDetector(device=args.device, extra_patterns=custom_patterns)
     scrubber = Scrubber(detector, mode=args.mode)
     counts: Counter = Counter()
@@ -235,10 +243,11 @@ def main(argv=None) -> int:
                     n_skipped += 1
                     print(f"  skipped {rec.id}: {rec.reason}", file=sys.stderr)
                     continue
-                if not _has_messages(rec.conv):
+                if args.posthog and not _has_messages(rec.conv):
                     # Metadata-only traces (e.g. a PostHog project that does not
-                    # capture $ai_input) stitch to zero messages. There is nothing
-                    # to scrub, so do not write an empty line for them.
+                    # capture $ai_input) stitch to zero messages. Skip them in
+                    # PostHog mode only; a local JSONL file is passed through as-is
+                    # so an empty conversation the user supplied is never dropped.
                     n_empty += 1
                     continue
                 if rec.incomplete:
@@ -318,9 +327,28 @@ def main(argv=None) -> int:
     return 0
 
 
+def _report_path_conflict(args, out_path):
+    """Return a label for the file --report would clobber, or None if it is safe.
+
+    Writing the report over the scrubbed output, the local input, or the PostHog
+    cursor would destroy data (in PostHog mode the cursor is already advanced), so
+    a collision must fail before any work begins.
+    """
+    report = os.path.realpath(args.report)
+    candidates = [("output file", out_path)]
+    if args.posthog:
+        candidates.append(("PostHog cursor file", args.cursor_file))
+    elif args.input:
+        candidates.append(("input file", args.input))
+    for label, path in candidates:
+        if path and os.path.realpath(path) == report:
+            return label
+    return None
+
+
 def _write_report(path, args, counts, n_conv, n_incomplete, n_empty, n_skipped,
                   n_custom, out_path) -> None:
-    """Write a JSON redaction report. Counts only: never the redacted values."""
+    """Write a JSON redaction report atomically. Counts only: never any values."""
     from datetime import datetime, timezone
 
     c = dict(counts)
@@ -339,9 +367,11 @@ def _write_report(path, args, counts, n_conv, n_incomplete, n_empty, n_skipped,
         "spans_by_category": {placeholder_prefix(k): v for k, v in sorted(c.items())},
         "output": out_path if n_conv else None,
     }
-    with open(path, "w", encoding="utf-8") as fh:
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(report, fh, indent=2)
         fh.write("\n")
+    os.replace(tmp, path)
     print(f"  report written          : {path}")
 
 
