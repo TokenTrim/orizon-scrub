@@ -45,6 +45,12 @@ export POSTHOG_PROJECT_ID=12345
 uv run orizon-scrub --posthog --window 30d       # -> traces.scrubbed.jsonl
 ```
 
+Your PostHog project must be **capturing LLM inputs and outputs** (the
+`$ai_input` and `$ai_output_choices` properties). If it only records metadata
+(token counts, cost), orizon-scrub prints `N trace(s) had no message content`
+and there is nothing to scrub. Turn on input/output capture in your PostHog LLM
+analytics settings, or export the traces to a JSONL file and scrub that instead.
+
 ## Options
 
 ```bash

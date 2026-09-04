@@ -286,8 +286,10 @@ def main(argv=None) -> int:
             # re-pull the same empty traces on every run and never make progress.
             commit()
             print(
-                f"\n{n_empty} trace(s) had no message content (the project may "
-                f"capture metadata only); nothing to scrub{existing}."
+                f"\n{n_empty} trace(s) had no message content; nothing to "
+                f"scrub{existing}.\nThe project may be capturing metadata only. "
+                "Enable LLM input/output capture ($ai_input, $ai_output_choices) "
+                "in PostHog, or scrub an exported JSONL file instead."
             )
         else:
             print(f"\nNo conversations to scrub; nothing written{existing}.")
