@@ -62,6 +62,27 @@ def _has_messages(conv: dict) -> bool:
     return isinstance(messages, list) and len(messages) > 0
 
 
+def _existing_trace_ids(path: str) -> set:
+    """Trace/conversation ids already present in an export, for resume dedup."""
+    ids: set = set()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                tid = obj.get("trace_id") or obj.get("id") if isinstance(obj, dict) else None
+                if tid is not None:
+                    ids.add(str(tid))
+    except OSError:
+        pass
+    return ids
+
+
 def default_output_path(input_path: str) -> str:
     if input_path.endswith(".jsonl"):
         return input_path[: -len(".jsonl")] + ".scrubbed.jsonl"
@@ -109,6 +130,12 @@ def _source(args):
             raise SystemExit(f"error: PostHog mode requires: {', '.join(missing)}")
         resuming = os.path.exists(args.cursor_file)
         start = posthog.load_cursor(args.cursor_file)
+        if resuming and start == (posthog._EPOCH_TS, ""):
+            # The cursor file exists but is empty or malformed (load_cursor reset it
+            # to the epoch sentinel). Treat this as a fresh pull that overwrites the
+            # output, not an append onto it, so a corrupt cursor cannot silently
+            # duplicate the existing export.
+            resuming = False
         records, final_cursor = posthog.pull(
             args.host, args.project_id, args.api_key, args.window, start
         )
@@ -231,8 +258,13 @@ def main(argv=None) -> int:
     detector = PrivacyFilterDetector(device=args.device, extra_patterns=custom_patterns)
     scrubber = Scrubber(detector, mode=args.mode)
     counts: Counter = Counter()
-    n_conv = n_incomplete = n_skipped = n_empty = 0
+    n_conv = n_incomplete = n_skipped = n_empty = n_dup = 0
     leaks: dict[str, list] = {}
+
+    # On resume, a trace that gained a new generation since the last pull would be
+    # stitched and appended again, duplicating it in the export. Skip any trace id
+    # already present in the accumulating output (first export wins).
+    exported_ids = _existing_trace_ids(out_path) if append else set()
 
     out_dir = os.path.dirname(os.path.abspath(out_path))
     fd, tmp_path = tempfile.mkstemp(prefix=".orizon-scrub-", suffix=".tmp", dir=out_dir)
@@ -242,6 +274,9 @@ def main(argv=None) -> int:
                 if rec.skipped:
                     n_skipped += 1
                     print(f"  skipped {rec.id}: {rec.reason}", file=sys.stderr)
+                    continue
+                if str(rec.id) in exported_ids:
+                    n_dup += 1
                     continue
                 if args.posthog and not _has_messages(rec.conv):
                     # Metadata-only traces (e.g. a PostHog project that does not
@@ -263,6 +298,9 @@ def main(argv=None) -> int:
         _quiet_remove(tmp_path)
         raise
 
+    if n_dup:
+        print(f"  skipped {n_dup} already-exported trace(s) (resume dedup)", file=sys.stderr)
+
     if leaks:
         # Fail loud; do NOT commit the cursor, so the pulled data can be re-fetched.
         _quiet_remove(tmp_path)
@@ -280,10 +318,14 @@ def main(argv=None) -> int:
         # Never overwrite an existing good output with an empty file.
         _quiet_remove(tmp_path)
         existing = " (existing output left unchanged)" if os.path.exists(out_path) else ""
+        if args.report:
+            _write_report(args.report, args, counts, n_conv, n_incomplete, n_empty,
+                          n_skipped, len(custom_patterns), out_path)
         if n_empty:
             # These traces were fetched and fully handled (no content to scrub), so
             # advance the cursor past them; otherwise a metadata-only project would
             # re-pull the same empty traces on every run and never make progress.
+            # Commit after the report so a report failure does not move the cursor.
             commit()
             print(
                 f"\n{n_empty} trace(s) had no message content; nothing to "
@@ -293,9 +335,6 @@ def main(argv=None) -> int:
             )
         else:
             print(f"\nNo conversations to scrub; nothing written{existing}.")
-        if args.report:
-            _write_report(args.report, args, counts, n_conv, n_incomplete, n_empty,
-                          n_skipped, len(custom_patterns), out_path)
         return 0
 
     try:
@@ -321,10 +360,12 @@ def main(argv=None) -> int:
     except BaseException:
         _quiet_remove(tmp_path)
         raise
-    commit()  # advance the resume cursor only after output is durable
+    # Write the report before advancing the cursor, so a report failure leaves the
+    # pull uncommitted and retryable rather than committed with no report.
     if args.report:
         _write_report(args.report, args, counts, n_conv, n_incomplete, n_empty,
                       n_skipped, len(custom_patterns), out_path)
+    commit()  # advance the resume cursor only after output and report are durable
     _print_summary(out_path, n_conv, n_incomplete, n_skipped, n_empty, counts)
     return 0
 
@@ -369,11 +410,18 @@ def _write_report(path, args, counts, n_conv, n_incomplete, n_empty, n_skipped,
         "spans_by_category": {placeholder_prefix(k): v for k, v in sorted(c.items())},
         "output": out_path if n_conv else None,
     }
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        json.dump(report, fh, indent=2)
-        fh.write("\n")
-    os.replace(tmp, path)
+    # Write via a unique temp file in the same directory (not "<path>.tmp", which
+    # could itself collide with the output/input/cursor), then atomically replace.
+    report_dir = os.path.dirname(os.path.abspath(path))
+    fd, tmp = tempfile.mkstemp(prefix=".orizon-report-", suffix=".tmp", dir=report_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        _quiet_remove(tmp)
+        raise
     print(f"  report written          : {path}")
 
 

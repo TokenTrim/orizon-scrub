@@ -238,26 +238,34 @@ class Scrubber:
                 part["function"] = fn
             return part
         if ptype_l in _MEDIA_PART_TYPES:
-            return self._redact_attachment_part(part, counts)
+            return self._redact_attachment_part(part, alias, per_cat, counts)
         # text / thinking / reasoning / unknown: scrub every string value (keys kept)
         # so PII in any text-bearing field is removed, never passed through.
         return self._scrub_json_value(part, alias, per_cat, counts)
 
-    def _redact_attachment_part(self, part, counts):
-        """Blank an attachment's payload (base64/URI/large blob) while keeping its
-        structure and small metadata enums (``detail``, ``format``, ``mime_type``)."""
+    def _redact_attachment_part(self, part, alias, per_cat, counts):
+        """Blank an attachment's payload (base64/URI/large blob) and scrub the rest.
+
+        Payload-looking strings become ``[ATTACHMENT REMOVED]``. Every other string
+        (a filename, a caption, ``alt`` text, a ``mime_type`` enum) is run through
+        the normal text scrubber rather than kept verbatim, so PII carried in media
+        metadata is redacted too. Small enums like ``png`` or ``high`` have no PII
+        and pass through unchanged. The ``type`` key is preserved so structure and
+        part dispatch stay intact."""
         counts["__attachments__"] += 1
 
-        def blank(value):
+        def clean(value):
             if isinstance(value, str):
-                return ATTACHMENT_MARKER if _looks_like_payload(value) else value
+                if _looks_like_payload(value):
+                    return ATTACHMENT_MARKER
+                return self._scrub_text(value, alias, per_cat, counts)
             if isinstance(value, dict):
-                return {k: blank(v) for k, v in value.items()}
+                return {k: clean(v) for k, v in value.items()}
             if isinstance(value, list):
-                return [blank(v) for v in value]
+                return [clean(v) for v in value]
             return value
 
-        return {k: (v if k == "type" else blank(v)) for k, v in part.items()}
+        return {k: (v if k == "type" else clean(v)) for k, v in part.items()}
 
     # -- JSON-aware and text scrubbing -----------------------------------
 

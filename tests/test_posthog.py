@@ -302,6 +302,76 @@ def test_report_path_collision_rejected(monkeypatch, tmp_path):
                           extra_args=["--report", str(tmp_path / "cur.json")])  # == cursor
 
 
+def test_report_tmp_does_not_clobber_output(monkeypatch, tmp_path):
+    # ORI-141 review: the report's temp file must not be "<output>", so naming the
+    # output like the report's old ".tmp" no longer truncates it.
+    recs = [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "hi"}]})]
+    rc, _, out = _run_posthog_main(
+        monkeypatch, tmp_path, recs, ("2026-09-01T00:00:00Z", "a"),
+        out_name="r.json.tmp", extra_args=["--report", str(tmp_path / "r.json")])
+    assert rc == 0
+    assert out.exists() and out.read_text().strip()  # scrubbed output intact
+    assert (tmp_path / "r.json").exists()
+
+
+def test_report_failure_does_not_commit_cursor(monkeypatch, tmp_path):
+    # ORI-141 review: report is written before the cursor is committed, so a report
+    # failure leaves the pull retryable rather than committed with no report.
+    import orizon_scrub.__main__ as m
+
+    monkeypatch.setattr(m, "PrivacyFilterDetector", _Blind)
+    monkeypatch.setattr(m, "_write_report", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    monkeypatch.setattr(m.posthog, "pull", lambda *a, **k: (
+        [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "hi"}]})],
+        ("2026-09-01T00:00:00Z", "a")))
+    cursor = tmp_path / "cur.json"
+    with pytest.raises(OSError):
+        m.main(["--posthog", "--host", "h", "--api-key", "phx_k", "--project-id", "1",
+                "--cursor-file", str(cursor), "-o", str(tmp_path / "out.jsonl"),
+                "--report", str(tmp_path / "r.json")])
+    assert not cursor.exists()  # cursor not advanced because the report failed first
+
+
+def test_malformed_cursor_overwrites_rather_than_appends(monkeypatch, tmp_path):
+    # ORI-141 review: a corrupt cursor must not append onto (duplicate) the export.
+    import orizon_scrub.__main__ as m
+
+    monkeypatch.setattr(m, "PrivacyFilterDetector", _Blind)
+    cursor = tmp_path / "cur.json"
+    cursor.write_text("{ not valid json")
+    out = tmp_path / "out.jsonl"
+    out.write_text(json.dumps({"trace_id": "old", "messages": [{"role": "user", "content": "old"}]}) + "\n")
+    monkeypatch.setattr(m.posthog, "pull", lambda *a, **k: (
+        [Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "new"}]})],
+        ("2026-09-02T00:00:00Z", "b")))
+    rc = m.main(["--posthog", "--host", "h", "--api-key", "phx_k", "--project-id", "1",
+                 "--cursor-file", str(cursor), "-o", str(out)])
+    assert rc == 0
+    ids = [json.loads(x)["trace_id"] for x in out.read_text().splitlines() if x.strip()]
+    assert ids == ["t1"]  # overwritten, not appended onto the stale export
+
+
+def test_resume_skips_already_exported_trace(monkeypatch, tmp_path):
+    # ORI-141 review: a trace that gained a new generation must not be re-appended.
+    import orizon_scrub.__main__ as m
+
+    monkeypatch.setattr(m, "PrivacyFilterDetector", _Blind)
+    cursor = tmp_path / "cur.json"
+    cursor.write_text(json.dumps({"ts": "2026-09-01T00:00:00Z", "uuid": "a"}))  # valid resume
+    out = tmp_path / "out.jsonl"
+    out.write_text(json.dumps({"trace_id": "t1", "messages": [{"role": "user", "content": "old"}]}) + "\n")
+    recs = [
+        Rec(id="t1", conv={"trace_id": "t1", "messages": [{"role": "user", "content": "new-t1"}]}),
+        Rec(id="t2", conv={"trace_id": "t2", "messages": [{"role": "user", "content": "t2"}]}),
+    ]
+    monkeypatch.setattr(m.posthog, "pull", lambda *a, **k: (recs, ("2026-09-02T00:00:00Z", "b")))
+    rc = m.main(["--posthog", "--host", "h", "--api-key", "phx_k", "--project-id", "1",
+                 "--cursor-file", str(cursor), "-o", str(out)])
+    assert rc == 0
+    ids = [json.loads(x)["trace_id"] for x in out.read_text().splitlines() if x.strip()]
+    assert ids == ["t1", "t2"]  # t1 kept once (first export), t2 appended, no duplicate
+
+
 def test_local_empty_conversation_is_not_dropped(monkeypatch, tmp_path):
     # The empty-trace skip is PostHog-only; a local file is passed through as-is.
     import orizon_scrub.__main__ as m

@@ -338,6 +338,24 @@ def test_card_glued_to_word_is_still_caught():
     assert find_leaks("039626639469462ca37adcb9810f3724") == []
 
 
+def test_attachment_metadata_is_scrubbed_not_passed_through():
+    # ORI-141 review: a media part's payload is blanked, but its text metadata
+    # (caption/alt/filename) must be scrubbed, not kept verbatim.
+    scrubber = Scrubber(StubDetector())
+    conv = {"messages": [{"role": "user", "content": [
+        {"type": "image_url",
+         "image_url": {"url": "data:image/png;base64,AAAABBBB"},
+         "alt": "passport photo of Sarah Johnson",
+         "detail": "high"},
+    ]}]}
+    out = scrubber.scrub_conversation(conv, Counter())
+    part = out["messages"][0]["content"][0]
+    assert part["type"] == "image_url"                       # structure preserved
+    assert part["image_url"]["url"] == "[ATTACHMENT REMOVED]"  # payload blanked
+    assert "Sarah Johnson" not in json.dumps(out)            # caption scrubbed
+    assert part["detail"] == "high"                          # harmless enum kept
+
+
 def test_custom_pattern_does_not_leak_on_its_own_placeholder():
     # A broad recognizer must not flag the digits of the placeholder it produced.
     cp = [CustomPattern("number", re.compile(r"\d+"))]
