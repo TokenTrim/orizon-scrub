@@ -6,7 +6,7 @@ Strip PII from your AI agent traces, **fully locally**, using
 ## Get PII-stripped traces
 
 ```bash
-git clone https://github.com/Lyadalachanchu/orizon-scrub.git
+git clone https://github.com/TokenTrim/orizon-scrub.git
 cd orizon-scrub
 uv run orizon-scrub
 ```
@@ -19,6 +19,19 @@ phone, address, account number, and secret replaced by consistent placeholders
 The first run installs dependencies and downloads the ~2.8 GB model to `~/.opf/`;
 after that startup is instant.
 
+## What you need
+
+- [`uv`](https://docs.astral.sh/uv/) and Python 3.11+. `uv run` handles the rest.
+- **No OpenAI or Anthropic API key.** The Privacy Filter model runs entirely on
+  your machine; nothing is sent to an LLM API.
+- The model is downloaded once from the **public** `openai/privacy-filter`
+  repository on Hugging Face, so **no Hugging Face token is required**. You may
+  optionally set `HF_TOKEN` to get higher rate limits and a faster first download.
+- **Only for PostHog mode:** a PostHog **personal** API key (`phx_...`) with the
+  `query:read` scope. That is the single credential the tool needs. The public
+  project key (`phc_...`) is write-only and cannot read traces. Scrubbing a local
+  JSONL file needs no credentials at all.
+
 ### Skip the wizard
 
 ```bash
@@ -26,7 +39,7 @@ after that startup is instant.
 uv run orizon-scrub traces.jsonl                 # -> traces.scrubbed.jsonl
 
 # or pull from PostHog (personal phx_ key with the query:read scope)
-export POSTHOG_HOST=https://us.posthog.com
+export POSTHOG_HOST=https://us.posthog.com       # use https://eu.posthog.com for EU
 export POSTHOG_API_KEY=phx_...
 export POSTHOG_PROJECT_ID=12345
 uv run orizon-scrub --posthog --window 30d       # -> traces.scrubbed.jsonl
